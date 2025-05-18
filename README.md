@@ -765,3 +765,16 @@ If you use this code, please cite:
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## 🔥 Local Qwen 3 Agent (Apple Silicon)
+
+> New in `qwen3-agent` branch
+
+1. `brew install cmake rust`
+2. `git submodule update --init`
+3. `bash scripts/build_llama_metal.sh`
+4. `pip install -e .`
+5. Download **Qwen3-14B-Q4_K_M.gguf** ➜ `~/models`
+6. `bash scripts/run_agent.sh`
+
+The `run_agent.sh` script exports the config path and launches `python -m agent.main`. Users on Intel Macs can unset `LLAMA_METAL` to force CPU inference.

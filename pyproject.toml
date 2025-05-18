@@ -1,0 +1,18 @@
+[project]
+name = "chainforge-agent"
+version = "0.3.0"
+dependencies = [
+  "llama-cpp-python[metal_simple]>=0.2.34",
+  "qwen-agent[rag,code_interpreter,mcp]>=0.8.0",
+  "pymoo>=0.6.0",
+  "psutil>=5.9",
+  "tomli>=2.0; python_version<'3.11'"
+]
+
+[tool.setuptools.packages.find]
+where = ["agent"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
