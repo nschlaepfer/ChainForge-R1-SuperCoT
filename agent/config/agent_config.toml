@@ -1,0 +1,21 @@
+[model]
+# path to the local GGUF model
+gguf_path = "~/models/Qwen3-14B-Q4_K_M.gguf"
+context_length = 4096
+temperature = 0.2
+top_p = 0.95
+top_k = 40
+enable_thinking = true
+
+[performance]
+threads = 8
+gpu_layers = 1
+
+[tools]
+code_interpreter = true
+shell = false
+search = false
+
+[paths]
+python_tool = "python"
+search_api_key = ""
