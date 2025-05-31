@@ -46,6 +46,81 @@ from torch.utils.data import Dataset, DataLoader
 import openai  # For DeepSeek
 import anthropic  # For Anthropic
 
+# Newer models and unified interfaces
+from typing import Optional, Dict
+
+DEVSTRAL_MODEL_NAME = "mistralai/Devstral-Small-2505"
+
+_DEVSTRAL_TOKENIZER = None
+_DEVSTRAL_MODEL = None
+
+
+def _load_devstral():
+    """Lazily load the Devstral model/tokenizer."""
+    global _DEVSTRAL_TOKENIZER, _DEVSTRAL_MODEL
+    if _DEVSTRAL_MODEL is None:
+        _DEVSTRAL_TOKENIZER = AutoTokenizer.from_pretrained(DEVSTRAL_MODEL_NAME)
+        _DEVSTRAL_MODEL = AutoModelForCausalLM.from_pretrained(DEVSTRAL_MODEL_NAME)
+    return _DEVSTRAL_MODEL, _DEVSTRAL_TOKENIZER
+
+
+def call_devstral(prompt: str, max_tokens: int = 1024) -> str:
+    """Generate a completion using Mistral's Devstral model."""
+    model, tokenizer = _load_devstral()
+    inputs = tokenizer.encode(prompt, return_tensors="pt")
+    outputs = model.generate(inputs, max_length=max_tokens)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+
+def call_qen(prompt: str, **kwargs) -> str:
+    """Placeholder for future QEN model integration."""
+    raise NotImplementedError("QEN 2.5 integration pending")
+
+
+def call_model(model_name: str, prompt: str, **kwargs):
+    """Unified helper for calling various models."""
+    if model_name in {"deepseek-reasoner", "deepseek-r1"}:
+        openai.api_key = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_KEY")
+        openai.api_base = "https://api.deepseek.com"
+        messages = kwargs.get(
+            "messages", [{"role": "user", "content": prompt}]
+        )
+        return openai.ChatCompletion.create(
+            model="deepseek-reasoner",
+            messages=messages,
+            max_tokens=kwargs.get("max_tokens", 512),
+        )
+    if model_name.startswith("claude-4") or model_name.startswith("claude-3"):
+        anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
+        client = anthropic.Client(api_key=anthropic_api_key)
+        return client.completions.create(
+            model=model_name,
+            prompt=prompt,
+            max_tokens_to_sample=kwargs.get("max_tokens", 1024),
+            thinking=kwargs.get("thinking", {"enabled": False}),
+        )
+    if model_name.startswith("devstral"):
+        return call_devstral(prompt, max_tokens=kwargs.get("max_tokens", 1024))
+    if model_name.startswith("qen"):
+        return call_qen(prompt, **kwargs)
+    raise ValueError(f"Unknown model: {model_name}")
+
+
+def diffusion_refine(chain_of_thought: str) -> str:
+    """Placeholder for future Diffusion-of-Thought refinement."""
+    return chain_of_thought
+
+
+def gather_reasoning(prompt: str, task_type: str = "general") -> str:
+    """Gather reasoning from the appropriate model based on task type."""
+    if task_type == "code":
+        return call_devstral(prompt)
+    if task_type in {"math", "logic"}:
+        resp = call_model("deepseek-reasoner", prompt, max_tokens=1024)
+        return resp["choices"][0]["reasoning_content"]
+    resp = call_model("claude-4-sonnet", prompt, max_tokens=1024)
+    return resp.completion["content"][-1]["text"]
+
 # Transformers for Qwen and RL pipeline
 from transformers import (
     AutoTokenizer,
@@ -92,14 +167,8 @@ def gather_data_deepseek_with_partial_anthropic(
         List of text strings, one per prompt. These can be used for SFT.
     """
 
-    # (a) Setup DeepSeek credentials
-    deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_KEY")
-    openai.api_key = deepseek_api_key
-    openai.api_base = "https://api.deepseek.com"
-
-    # (b) Setup Anthropic client
+    # Model credentials are handled inside `call_model`
     anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
-    anthro_client = anthropic.Client(api_key=anthropic_api_key)
 
     results = []
     messages_history = []  # Track short conversation memory for deepseek
@@ -111,11 +180,12 @@ def gather_data_deepseek_with_partial_anthropic(
         messages = messages_history + [{"role": "user", "content": user_prompt}]
 
         try:
-            # 1) Call DeepSeek
-            response = openai.ChatCompletion.create(
-                model=deepseek_model,
+            # 1) Call DeepSeek via the unified API
+            response = call_model(
+                deepseek_model,
+                prompt=user_prompt,
+                max_tokens=1024,
                 messages=messages,
-                max_tokens=1024,  # final answer length
             )
             choice = response.choices[0].message
 
@@ -141,7 +211,6 @@ def gather_data_deepseek_with_partial_anthropic(
                         if is_uncertain_step(reasoning_text):
                             # We call Anthropic to produce an explanation
                             expansion = call_anthropic_expansion(
-                                anthro_client,
                                 anthropic_model,
                                 reasoning_text,
                                 max_tokens=anthropic_max_tokens,
@@ -172,6 +241,7 @@ def gather_data_deepseek_with_partial_anthropic(
 
             # Join them back
             final_cot = "</think>".join(reconstructed_cot)
+            final_cot = diffusion_refine(final_cot)
 
             # 4) Format for training
             single_text = (
@@ -205,7 +275,7 @@ def is_uncertain_step(text):
     return False
 
 
-def call_anthropic_expansion(client, model_name, raw_thought, max_tokens=512):
+def call_anthropic_expansion(model_name, raw_thought, max_tokens=512):
     """
     Call Anthropic for a short expansion of 'raw_thought'.
     We ask for partial/factual justification. In practice,
@@ -219,12 +289,11 @@ def call_anthropic_expansion(client, model_name, raw_thought, max_tokens=512):
         f"{anthropic.AI_PROMPT}"
     )
 
-    resp = client.completions.create(
-        model=model_name,
-        max_tokens_to_sample=max_tokens,
-        temperature=0.7,
-        top_p=0.9,
+    resp = call_model(
+        model_name,
         prompt=prompt_text,
+        max_tokens=max_tokens,
+        thinking={"enabled": False},
     )
     return resp.completion.strip()
 

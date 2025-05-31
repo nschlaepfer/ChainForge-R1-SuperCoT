@@ -1,6 +1,11 @@
 # ChainForge: R1 + Super CoT
 
-ChainForge demonstrates a multi-stage workflow for training Qwen2.5 models using ideas from the [DeepSeek-R1 paper](https://arxiv.org/pdf/2501.12948). It combines DeepSeek Reasoner's chain-of-thought (CoT) output with optional Anthropic Claude expansions.
+ChainForge demonstrates a multi-stage workflow for training Qwen2.5 models using
+ideas from the [DeepSeek-R1 paper](https://arxiv.org/pdf/2501.12948). It combines
+DeepSeek Reasoner's chain-of-thought (CoT) output with optional Anthropic Claude
+expansions. This revision includes a unified `call_model()` helper and adds
+support for Claude 4, the latest DeepSeek-R1 checkpoint, and Mistral's Devstral
+model.
 
 Key stages include:
 
@@ -9,6 +14,7 @@ Key stages include:
 3. **Reasoning-Oriented RL** – train the model with a GRPO-style algorithm.
 4. **Rejection Sampling** – filter the best RL completions and run an additional SFT pass.
 5. **Final RL & Optional Distillation** – further improve the model and optionally distill to smaller checkpoints.
+6. A placeholder `diffusion_refine()` hook exists for future Diffusion-of-Thought reasoning refinements.
 
 ## Requirements
 
