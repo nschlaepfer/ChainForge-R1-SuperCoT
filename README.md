@@ -1,4 +1,4 @@
-# ChainForge: R1 + Super CoT
+# ChainForge
 
 ChainForge demonstrates a multi-stage workflow for training Qwen2.5 models using
 ideas from the [DeepSeek-R1 paper](https://arxiv.org/pdf/2501.12948). It combines
