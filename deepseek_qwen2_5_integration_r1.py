@@ -41,6 +41,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
 
 # External API clients
 import openai  # For DeepSeek
@@ -53,6 +55,51 @@ DEVSTRAL_MODEL_NAME = "mistralai/Devstral-Small-2505"
 
 _DEVSTRAL_TOKENIZER = None
 _DEVSTRAL_MODEL = None
+
+
+@dataclass
+class RewardConfig:
+    """Configuration for modular reward functions."""
+
+    reward_format_weight: float = 0.1
+    reward_content_weight: float = 1.0
+    correct_answer: Optional[str] = None
+
+
+@dataclass
+class TrainingArgs:
+    """Centralized training hyper-parameters."""
+
+    num_rl_steps: int = 50
+    group_size: int = 4
+    lr: float = 1e-6
+    clip_ratio: float = 0.2
+    kl_coeff: float = 0.001
+    kl_target: float = 0.02
+    adapt_kl_interval: int = 50
+    checkpoint_dir: str = "ckpts"
+    checkpoint_interval: int = 100
+    resume: bool = True
+    quantize_kv_bits: int = 0  # 0 disables
+    use_speculative: bool = False
+
+
+def _save_checkpoint(step: int, policy: nn.Module, optimizer: torch.optim.Optimizer, out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_path = os.path.join(out_dir, "ckpt.tmp")
+    path = os.path.join(out_dir, "ckpt.pt")
+    torch.save({"step": step, "model": policy.state_dict(), "optim": optimizer.state_dict()}, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _load_checkpoint(policy: nn.Module, optimizer: torch.optim.Optimizer, out_dir: str):
+    path = os.path.join(out_dir, "ckpt.pt")
+    if not os.path.exists(path):
+        return 0
+    data = torch.load(path, map_location="cpu")
+    policy.load_state_dict(data["model"])
+    optimizer.load_state_dict(data["optim"])
+    return data.get("step", 0)
 
 
 def _load_devstral():
@@ -484,21 +531,62 @@ class GRPOTorchPolicy(nn.Module):
         return lp
 
 
-def compute_reward(response_text, ground_truth):
-    """
-    A simple reward function for demonstration:
-      - +1 if ground_truth is in the response,
-      - +0.2 if it has <reasoning_process> and <summary> tags.
+def _format_reward(text: str) -> float:
+    """Reward for adhering to <think>...<answer> formatting."""
+    has_think = "<think>" in text and "</think>" in text
+    has_ans = "<answer>" in text and "</answer>" in text
+    if has_think and has_ans:
+        return 1.0
+    if has_think or has_ans:
+        return 0.5
+    return 0.0
 
-    In real usage, you'd define a domain-appropriate reward,
-    possibly hooking in partial correctness checks.
-    """
-    reward = 0.0
-    if "<reasoning_process>" in response_text and "<summary>" in response_text:
-        reward += 0.2
-    if ground_truth in response_text:
-        reward += 1.0
-    return reward
+
+def _math_eval_reward(text: str, correct: Optional[str]) -> float:
+    if not correct:
+        return 0.0
+    answer = None
+    if "<answer>" in text and "</answer>" in text:
+        answer = text.split("<answer>")[1].split("</answer>")[0].strip()
+    elif "<summary>" in text and "</summary>" in text:
+        answer = text.split("<summary>")[1].split("</summary>")[0].strip()
+    if answer is None:
+        return 0.0
+    try:
+        pred = eval(answer, {"__builtins__": {}})
+    except Exception:
+        try:
+            pred = float(answer)
+        except Exception:
+            return 0.0
+    try:
+        gt = eval(correct, {"__builtins__": {}})
+    except Exception:
+        try:
+            gt = float(correct)
+        except Exception:
+            return 0.0
+    return 1.0 if pred == gt else 0.0
+
+
+def _jaccard_reward(text: str, reference: str) -> float:
+    if reference is None:
+        return 0.0
+    gen_words = set(text.split())
+    ref_words = set(reference.split())
+    if not ref_words:
+        return 0.0
+    return len(gen_words & ref_words) / len(gen_words | ref_words)
+
+
+def compute_reward(response_text: str, ground_truth: str, cfg: RewardConfig) -> float:
+    """Composite reward using format and content signals."""
+    fmt_r = _format_reward(response_text)
+    if cfg.correct_answer:
+        cont_r = _math_eval_reward(response_text, cfg.correct_answer)
+    else:
+        cont_r = _jaccard_reward(response_text, ground_truth)
+    return cfg.reward_format_weight * fmt_r + cfg.reward_content_weight * cont_r
 
 
 def sample_responses(
@@ -509,6 +597,8 @@ def sample_responses(
     num_samples=4,
     temperature=0.7,
     max_new_tokens=128,
+    quantize_bits: int = 0,
+    draft_model=None,
 ):
     """
     Sample multiple responses from the policy. We do a simple prompt format.
@@ -524,17 +614,42 @@ def sample_responses(
 
     encoded_prompt = tokenizer.encode(text, return_tensors="pt").to(device)
 
+    if quantize_bits > 0 and hasattr(model, "quantize"):
+        try:
+            model.quantize(bits=quantize_bits)
+        except Exception:
+            pass
+
     all_responses = []
     with torch.no_grad():
         for _ in range(num_samples):
-            gen_ids = model.generate(
-                encoded_prompt,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=0.95,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            if draft_model is not None:
+                # simple speculative decoding: sample from draft then verify
+                draft_ids = draft_model.generate(
+                    encoded_prompt,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.95,
+                )
+                gen_ids = model.generate(
+                    encoded_prompt,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.eos_token_id,
+                    decoder_input_ids=draft_ids[:, -1:],
+                )
+            else:
+                gen_ids = model.generate(
+                    encoded_prompt,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
             new_text = tokenizer.decode(
                 gen_ids[0][len(encoded_prompt[0]) :], skip_special_tokens=True
             )
@@ -547,12 +662,9 @@ def rl_training_grpo(
     policy_model,
     tokenizer,
     rl_dataset,
-    num_rl_steps=50,
-    group_size=4,
+    args: TrainingArgs,
+    reward_cfg: RewardConfig,
     device="cuda",
-    lr=1e-6,
-    clip_ratio=0.2,
-    kl_coeff=0.001,
 ):
     """
     The RL training loop, following the GRPO approach from DeepSeek-R1.
@@ -566,7 +678,11 @@ def rl_training_grpo(
     """
     policy_model = policy_model.to(device)
     policy_model.train()
-    optimizer = AdamW(policy_model.parameters(), lr=lr)
+    optimizer = AdamW(policy_model.parameters(), lr=args.lr)
+    if args.resume:
+        step_count = _load_checkpoint(policy_model, optimizer, args.checkpoint_dir)
+    else:
+        step_count = 0
 
     # Reference model (for KL term) - same architecture
     ref_model = AutoModelForCausalLM.from_pretrained(
@@ -576,11 +692,12 @@ def rl_training_grpo(
     for p in ref_model.parameters():
         p.requires_grad_(False)
 
-    step_count = 0
     data_indices = list(range(len(rl_dataset)))
     random.shuffle(data_indices)
 
-    while step_count < num_rl_steps:
+    kl_coeff = args.kl_coeff
+    mean_kl = 0.0
+    while step_count < args.num_rl_steps:
         for idx in data_indices:
             sample = rl_dataset[idx]
             question = sample["question"]
@@ -592,11 +709,13 @@ def rl_training_grpo(
                     tokenizer,
                     question,
                     device=device,
-                    num_samples=group_size,
+                    num_samples=args.group_size,
+                    quantize_bits=args.quantize_kv_bits,
+                    draft_model=None,
                 )
 
             # compute rewards and group advantage
-            rewards = [compute_reward(r, ground_truth) for r in responses]
+            rewards = [compute_reward(r, ground_truth, reward_cfg) for r in responses]
             mean_r = sum(rewards) / len(rewards)
             std_r = max(
                 1e-6, (sum((x - mean_r) ** 2 for x in rewards) / len(rewards)) ** 0.5
@@ -604,7 +723,7 @@ def rl_training_grpo(
             advantages = [(r - mean_r) / std_r for r in rewards]
 
             # Update for each response in the group
-            for g_idx in range(group_size):
+            for g_idx in range(args.group_size):
                 resp_text = responses[g_idx]
                 adv = advantages[g_idx]
 
@@ -633,12 +752,13 @@ def rl_training_grpo(
 
                 # PPO clipped objective
                 surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
+                surr2 = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv
                 policy_loss = -torch.min(surr1, surr2)
 
                 # KL penalty
                 kl_penalty = kl_coeff * (pol_lp - ref_lp)
                 total_loss = policy_loss + kl_penalty
+                mean_kl += (pol_lp - ref_lp).abs().item()
 
                 total_loss.backward()
                 optimizer.step()
@@ -653,15 +773,25 @@ def rl_training_grpo(
                         f"loss={policy_loss.item():.4f}"
                     )
 
-                if step_count >= num_rl_steps:
+                if step_count % args.checkpoint_interval == 0:
+                    _save_checkpoint(step_count, policy_model, optimizer, args.checkpoint_dir)
+                if step_count % args.adapt_kl_interval == 0 and step_count > 0:
+                    avg_kl = mean_kl / max(1, args.adapt_kl_interval * args.group_size)
+                    if avg_kl > args.kl_target * 1.5:
+                        kl_coeff *= 1.5
+                    elif avg_kl < args.kl_target / 1.5:
+                        kl_coeff /= 1.5
+                    mean_kl = 0.0
+                if step_count >= args.num_rl_steps:
                     break
 
-            if step_count >= num_rl_steps:
+            if step_count >= args.num_rl_steps:
                 break
 
-        if step_count >= num_rl_steps:
+        if step_count >= args.num_rl_steps:
             break
 
+    _save_checkpoint(step_count, policy_model, optimizer, args.checkpoint_dir)
     return policy_model.model
 
 
@@ -689,13 +819,19 @@ def rejection_sampling_data_gen(
         gt = item["ground_truth"]
 
         candidates = sample_responses(
-            rl_model, tokenizer, question, device=device, num_samples=num_samples
+            rl_model,
+            tokenizer,
+            question,
+            device=device,
+            num_samples=num_samples,
+            quantize_bits=0,
+            draft_model=None,
         )
 
         best_resp = None
         best_r = float("-inf")
         for resp in candidates:
-            r = compute_reward(resp, gt)
+            r = compute_reward(resp, gt, RewardConfig(correct_answer=gt))
             if r > best_r:
                 best_r = r
                 best_resp = resp
@@ -935,14 +1071,15 @@ def main():
     print("\n=== Stage 2: Reasoning-Oriented RL ===")
     rl_dataset = MockRLReasoningDataset(tokenizer=tokenizer, num_samples=12)
     policy = GRPOTorchPolicy(model)
+    rl_args = TrainingArgs(num_rl_steps=30, group_size=4, lr=1e-6)
+    reward_cfg = RewardConfig()
     updated_model = rl_training_grpo(
         policy_model=policy,
         tokenizer=tokenizer,
         rl_dataset=rl_dataset,
-        num_rl_steps=30,
-        group_size=4,
+        args=rl_args,
+        reward_cfg=reward_cfg,
         device=device,
-        lr=1e-6,
     )
     updated_model.save_pretrained("qwen_rl_ckpt_stage2")
     tokenizer.save_pretrained("qwen_rl_ckpt_stage2")
@@ -988,14 +1125,15 @@ def main():
     ).to(device)
 
     policy2 = GRPOTorchPolicy(model_after_stage3)
+    rl_args_final = TrainingArgs(num_rl_steps=20, group_size=2, lr=1e-6)
+    reward_cfg_final = RewardConfig()
     final_rl_model = rl_training_grpo(
         policy_model=policy2,
         tokenizer=tokenizer,
         rl_dataset=rl_dataset,
-        num_rl_steps=20,
-        group_size=2,
+        args=rl_args_final,
+        reward_cfg=reward_cfg_final,
         device=device,
-        lr=1e-6,
     )
     final_rl_model.save_pretrained("qwen_rl_ckpt_final")
     tokenizer.save_pretrained("qwen_rl_ckpt_final")

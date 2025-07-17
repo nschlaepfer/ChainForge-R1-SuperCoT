@@ -43,6 +43,19 @@ python deepseek_qwen2_5_integration_r1.py
 └── README.md
 ```
 
+## MLX-GRPO Enhancements
+
+The training script now includes features inspired by the MLX-GRPO project:
+
+- **Dataclass configs** – `TrainingArgs` and `RewardConfig` centralise
+  hyper-parameters and reward weights.
+- **Modular rewards** – format and content rewards can be combined for
+  verifiable tasks.
+- **Adaptive KL penalty** and **atomic checkpointing** ensure stable RL runs
+  that can be resumed from the last checkpoint.
+- Optional **KV cache quantisation** and basic **speculative decoding** speed
+  up generation on Apple Silicon.
+
 ## Citation
 
 If you use this project, please cite the DeepSeek-R1 paper:
